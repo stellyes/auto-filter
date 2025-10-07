@@ -1,234 +1,207 @@
-from rembg import remove
-from PIL import Image, ImageOps, ImageEnhance
-import numpy as np
 import cv2
-from io import BytesIO
-import math
-import os
+import numpy as np
+from PIL import Image, ImageEnhance
+from pathlib import Path
 
-# === Parameters ===
-MARGIN_RATIO = 0.076         # 7.6% margin
-WHITE_POINT = 219
-BLACK_POINT = 0
-MIDPOINT = 1.0
-BRIGHTNESS_INCREASE = 1.05
-CONTRAST_INCREASE = 1.14
-MAX_SIZE = 1000              # final max dimension
-RESIZE_FOR_REMOVAL = 1200    # size rembg receives
+# Text color values
+RED = "\033[31m"
+GREEN = "\033[32m"
+RESET = "\033[0m" # Resets all formatting
 
-# === DETECTION PARAMETERS ===
-COLOR_DIST_THRESH = 8        # Distance from white to consider non-background (lowered to catch subtle flower)
-MIN_OBJECT_AREA = 50         # Minimum pixels for a valid object (very low to catch all fragments)
-PAD_FRAC = 0.15              # Padding around detected objects
-MIN_PAD_PX = 30              # Minimum padding
+# Styles
+BOLD = "\033[1m"
+UNDERLINE = "\033[4m"
 
-DEBUG = True
-
-def apply_levels(img: Image.Image, black_point=0, gamma=1.0, white_point=255):
-    arr = np.array(img).astype(np.float32)
-    arr = (arr - black_point) / (white_point - black_point)
-    arr = np.clip(arr, 0, 1)
-    arr = arr ** (1.0 / gamma)
-    arr = (arr * 255).astype(np.uint8)
-    return Image.fromarray(arr)
-
-def ensure_dirs(path):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-def debug_save(img, path):
-    ensure_dirs(path)
-    if isinstance(img, np.ndarray):
-        if img.dtype == np.bool_:
-            img = (img.astype(np.uint8) * 255)
-        if img.ndim == 2:
-            Image.fromarray(img).save(path)
-            return
-        elif img.ndim == 3:
-            Image.fromarray(img).save(path)
-            return
-    img.save(path)
-
-def detect_objects_in_original(orig_img: Image.Image, debug_dir=None):
+def remove_background(image_path, output_path):
     """
-    Detect all non-background objects using edge detection
-    Returns bounding box (x0, y0, x1, y1) that encompasses all objects
+    Remove white/grey background, crop to square with margins, and apply adjustments.
+    Produces clean output with white background.
+    
+    Args:
+        image_path: Path to input image
+        output_path: Path to save processed image
     """
-    W, H = orig_img.size
-    max_dim = max(W, H)
+    # Read image
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f">>> {RED}{BOLD}FILE READ ERROR:{RESET}\
+                         \n>>> Could not read image from {UNDERLINE}{image_path}{RESET}")
     
-    # Convert to numpy
-    rgb = np.asarray(orig_img.convert("RGB")).astype(np.uint8)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    # Convert to RGB for PIL processing
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Use edge detection instead of color distance
-    edges = cv2.Canny(gray, 30, 100)
+    # Convert to grayscale for mask creation
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    if debug_dir:
-        debug_save(edges, os.path.join(debug_dir, "debug_original_mask_raw.png"))
+    # Apply bilateral filter to preserve edges while removing noise
+    gray_filtered = cv2.bilateralFilter(gray, 9, 75, 75)
     
-    # Dilate edges to create object regions
-    kernel = np.ones((11, 11), np.uint8)
-    mask_clean = cv2.dilate(edges, kernel, iterations=3)
+    # Use multiple thresholding approaches and combine
+    # Approach 1: Simple threshold for bright backgrounds
+    _, mask1 = cv2.threshold(gray_filtered, 200, 255, cv2.THRESH_BINARY_INV)
     
-    if debug_dir:
-        debug_save(mask_clean, os.path.join(debug_dir, "debug_original_mask_clean.png"))
+    # Approach 2: Detect near-white pixels more aggressively
+    # This catches light gray background noise
+    _, mask2 = cv2.threshold(gray_filtered, 170, 255, cv2.THRESH_BINARY_INV)
     
-    # Find connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_clean, connectivity=8)
+    # Combine masks - be conservative (only keep clearly non-background pixels)
+    mask = cv2.bitwise_and(mask1, mask2)
     
-    # Collect all valid objects and print sizes for debugging
-    valid_mask = np.zeros_like(mask_clean, dtype=bool)
-    valid_count = 0
+    # Morphological operations focused on noise removal without eroding object edges
+    kernel_small = np.ones((3, 3), np.uint8)
+    kernel_medium = np.ones((5, 5), np.uint8)
+    kernel_large = np.ones((9, 9), np.uint8)
     
-    if debug_dir:
-        print(f"\n=== Component Analysis ===")
-        print(f"Total components found: {num_labels - 1}")
+    # Close small gaps in objects
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small, iterations=3)
     
-    for label in range(1, num_labels):  # Skip background (0)
-        area = stats[label, cv2.CC_STAT_AREA]
-        x, y, w, h = stats[label, cv2.CC_STAT_LEFT], stats[label, cv2.CC_STAT_TOP], stats[label, cv2.CC_STAT_WIDTH], stats[label, cv2.CC_STAT_HEIGHT]
-        
-        if debug_dir:
-            print(f"Component {label}: area={area} pixels, bbox=({x},{y},{w}x{h})")
-        
-        if area > MIN_OBJECT_AREA:
-            valid_mask |= (labels == label)
-            valid_count += 1
-            if debug_dir:
-                print(f"  -> KEPT (area > {MIN_OBJECT_AREA})")
-        elif debug_dir:
-            print(f"  -> FILTERED OUT (area <= {MIN_OBJECT_AREA})")
+    # Remove small scattered noise
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_medium, iterations=2)
     
-    if debug_dir:
-        debug_save(valid_mask.astype(np.uint8) * 255, os.path.join(debug_dir, "debug_original_objects.png"))
-        print(f"\nKept {valid_count} valid objects")
-        print(f"=========================\n")
+    # Close larger gaps to solidify objects
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large, iterations=2)
     
-    # Find bounding box
-    ys, xs = np.where(valid_mask)
-    if len(xs) == 0 or len(ys) == 0:
-        return None
+    # Light erosion-dilation to smooth edges without losing detail
+    mask = cv2.erode(mask, kernel_small, iterations=1)
+    mask = cv2.dilate(mask, kernel_small, iterations=1)
     
-    x0, x1 = xs.min(), xs.max()
-    y0, y1 = ys.min(), ys.max()
+    # Find contours of objects
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Add asymmetric padding
-    pad_horizontal = max(MIN_PAD_PX, int(max_dim * PAD_FRAC))
-    pad_bottom = max(MIN_PAD_PX, int(max_dim * PAD_FRAC))
-    pad_top = max(MIN_PAD_PX // 2, int(max_dim * PAD_FRAC * 0.5))
+    if not contours:
+        raise ValueError(">>> {RED}{BOLD}IMAGE PROCESSING ERROR:{RESET}\
+                         \n>>> No objects detected in image")
     
-    x0 = max(0, x0 - pad_horizontal)
-    y0 = max(0, y0 - pad_top)
-    x1 = min(W, x1 + pad_horizontal)
-    y1 = min(H, y1 + pad_bottom)
+    # Filter out very small contours (noise)
+    min_contour_area = 1500  # Balanced threshold
+    contours = [c for c in contours if cv2.contourArea(c) > min_contour_area]
     
-    if debug_dir:
-        debug_img = rgb.copy()
-        cv2.rectangle(debug_img, (x0, y0), (x1, y1), (255, 0, 0), 3)
-        Image.fromarray(debug_img).save(os.path.join(debug_dir, "debug_original_bbox.png"))
+    if not contours:
+        raise ValueError(">>> {RED}{BOLD}IMAGE PROCESSING ERROR:{RESET}\
+                        \n>>> No significant objects detected in image")
     
-    return (x0, y0, x1, y1)
-
-def process_image(input_path, output_path):
-    debug_dir = os.path.splitext(output_path)[0] + "_debug"
-    if DEBUG and not os.path.exists(debug_dir):
-        os.makedirs(debug_dir)
-
-    # --- open & orient & resize original ---
-    orig = Image.open(input_path)
-    orig = ImageOps.exif_transpose(orig)
-    orig.thumbnail((RESIZE_FOR_REMOVAL, RESIZE_FOR_REMOVAL), Image.Resampling.LANCZOS)
-
-    if DEBUG:
-        debug_save(orig.convert("RGB"), os.path.join(debug_dir, "debug_orig_before_rembg.png"))
-
-    # --- Detect objects in original BEFORE rembg ---
-    bbox = detect_objects_in_original(orig, debug_dir=debug_dir if DEBUG else None)
-
-    # --- background removal ---
-    buf = BytesIO()
-    orig.save(buf, format="PNG")
-    buf.seek(0)
-
-    try:
-        result = remove(
-            buf.read(),
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_structure_size=6,
-        )
-    except Exception as e:
-        print(f"[WARN] Alpha matting failed ({e}), falling back to plain remove.")
-        buf.seek(0)
-        result = remove(buf.read())
-
-    rembg_obj = Image.open(BytesIO(result)).convert("RGBA")
-    if DEBUG:
-        debug_save(rembg_obj, os.path.join(debug_dir, "debug_rembg_post.png"))
-
-    # --- Use the bbox from original detection to crop rembg output ---
-    if bbox is None:
-        print("[WARN] No objects detected, using full image")
-        cropped_obj = rembg_obj
+    # Create a clean mask with only the largest valid contours
+    # Use convex hull to preserve object edges and fill in any gaps
+    clean_mask = np.zeros_like(mask)
+    for contour in contours:
+        # Get convex hull to preserve object shape
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(clean_mask, [hull], -1, 255, -1)
+    
+    # Use the clean mask instead of the noisy one
+    mask = clean_mask
+    
+    # Get bounding box that encompasses all objects
+    all_points = np.vstack(contours)
+    x, y, w, h = cv2.boundingRect(all_points)
+    
+    # Add small padding to ensure we capture full objects
+    padding = 5
+    x = max(0, x - padding)
+    y = max(0, y - padding)
+    w = min(img.shape[1] - x, w + 2 * padding)
+    h = min(img.shape[0] - y, h + 2 * padding)
+    
+    # Calculate square crop with 7.6% margin
+    margin_ratio = 0.076
+    object_ratio = 1 - 2 * margin_ratio  # 0.848
+    
+    # Determine the size needed for square crop
+    max_dim = max(w, h)
+    square_size = int(max_dim / object_ratio)
+    
+    # Calculate center of objects
+    center_x = x + w // 2
+    center_y = y + h // 2
+    
+    # Calculate crop coordinates (centered)
+    crop_x1 = center_x - square_size // 2
+    crop_y1 = center_y - square_size // 2
+    crop_x2 = crop_x1 + square_size
+    crop_y2 = crop_y1 + square_size
+    
+    # Create white canvas for final image
+    canvas = np.ones((square_size, square_size, 3), dtype=np.uint8) * 255
+    
+    # Calculate paste position
+    paste_x = 0
+    paste_y = 0
+    src_x1 = crop_x1
+    src_y1 = crop_y1
+    src_x2 = crop_x2
+    src_y2 = crop_y2
+    
+    # Adjust if crop extends beyond image boundaries
+    if crop_x1 < 0:
+        paste_x = -crop_x1
+        src_x1 = 0
+    if crop_y1 < 0:
+        paste_y = -crop_y1
+        src_y1 = 0
+    if crop_x2 > img.shape[1]:
+        src_x2 = img.shape[1]
+    if crop_y2 > img.shape[0]:
+        src_y2 = img.shape[0]
+    
+    # Calculate dimensions
+    src_w = src_x2 - src_x1
+    src_h = src_y2 - src_y1
+    
+    # Extract source region
+    source_region = img_rgb[src_y1:src_y2, src_x1:src_x2]
+    mask_region = mask[src_y1:src_y2, src_x1:src_x2]
+    
+    # Apply mask to source region
+    mask_3channel = cv2.cvtColor(mask_region, cv2.COLOR_GRAY2RGB) / 255.0
+    masked_source = (source_region * mask_3channel).astype(np.uint8)
+    
+    # Create white background for masked areas
+    white_bg = np.ones_like(source_region) * 255
+    final_region = (masked_source + white_bg * (1 - mask_3channel)).astype(np.uint8)
+    
+    # Additional cleanup: replace any remaining gray pixels with pure white
+    # Convert to grayscale to detect gray areas
+    final_gray = cv2.cvtColor(final_region, cv2.COLOR_RGB2GRAY)
+    # Any pixel brighter than 200 gets set to white
+    gray_pixels = final_gray > 200
+    final_region[gray_pixels] = [255, 255, 255]
+    
+    # Paste onto canvas
+    canvas[paste_y:paste_y+src_h, paste_x:paste_x+src_w] = final_region
+    
+    # Convert to PIL for adjustments
+    pil_img = Image.fromarray(canvas)
+    
+    # Increase brightness by 7% (5% + 2%)
+    brightness_enhancer = ImageEnhance.Brightness(pil_img)
+    pil_img = brightness_enhancer.enhance(1.07)
+    
+    # Increase contrast by 16% (14% + 2%)
+    contrast_enhancer = ImageEnhance.Contrast(pil_img)
+    pil_img = contrast_enhancer.enhance(1.16)
+    
+    # Apply levels adjustment: white point = 219, midpoint = 1, black point unchanged
+    img_array = np.array(pil_img).astype(np.float32)
+    
+    # Apply white point adjustment (map 219 to 255)
+    # Formula: output = input * (255 / white_point)
+    img_array = np.clip(img_array * (255.0 / 219.0), 0, 255)
+    
+    # Convert back to uint8
+    result = img_array.astype(np.uint8)
+    final_img = Image.fromarray(result)
+    
+    # Save result as JPEG with high quality
+    if output_path.lower().endswith(('.jpg', '.jpeg')):
+        final_img.save("filtered-photos/" + output_path, 'JPEG', quality=95)
     else:
-        x0, y0, x1, y1 = bbox
-        cropped_obj = rembg_obj.crop((x0, y0, x1, y1))
-        if DEBUG:
-            debug_save(cropped_obj, os.path.join(debug_dir, "debug_cropped.png"))
+        final_img.save("filtered-photos/" + output_path)
 
-    # --- create square canvas and center the cropped object ---
-    w, h = cropped_obj.size
-    max_side = max(w, h)
-    target = math.ceil(max_side / (1 - 2 * MARGIN_RATIO))
-    canvas = Image.new("RGBA", (target, target), (255, 255, 255, 0))
-
-    # scale object to fit exactly within margins (preserve aspect ratio)
-    max_obj = int(target * (1 - 2 * MARGIN_RATIO))
-    scale = max_obj / max(w, h)
-    new_w, new_h = int(w * scale), int(h * scale)
-    obj_resized = cropped_obj.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-    x_off = (target - new_w) // 2
-    y_off = (target - new_h) // 2
-    canvas.paste(obj_resized, (x_off, y_off), obj_resized)
-    
-    if DEBUG:
-        debug_save(canvas.convert("RGBA"), os.path.join(debug_dir, "debug_centered.png"))
-
-    # --- levels (RGB only) ---
-    r, g, b, a = canvas.split()
-    rgb = Image.merge("RGB", (r, g, b))
-    rgb = apply_levels(rgb, BLACK_POINT, MIDPOINT, WHITE_POINT)
-    canvas = Image.merge("RGBA", (*rgb.split(), a))
-
-    # --- brightness + contrast ---
-    r, g, b, a = canvas.split()
-    rgb = Image.merge("RGB", (r, g, b))
-    rgb = ImageEnhance.Brightness(rgb).enhance(BRIGHTNESS_INCREASE)
-    rgb = ImageEnhance.Contrast(rgb).enhance(CONTRAST_INCREASE)
-    canvas = Image.merge("RGBA", (*rgb.split(), a))
-
-    # --- final resize if needed ---
-    max_dim = max(canvas.size)
-    if max_dim > MAX_SIZE:
-        scale_f = MAX_SIZE / max_dim
-        new_w = int(canvas.width * scale_f)
-        new_h = int(canvas.height * scale_f)
-        canvas = canvas.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-    # --- flatten on white and save ---
-    final = Image.new("RGB", canvas.size, "white")
-    final.paste(canvas, mask=canvas.split()[-1])
-    ensure_dirs(output_path)
-    final.save(output_path, quality=95)
-    
-    if DEBUG:
-        debug_save(final, os.path.join(debug_dir, "debug_final.png"))
-        print(f"Saved processed image to {output_path}")
-        print(f"Debug files in folder: {debug_dir}")
+    print(f">>> {GREEN}{BOLD}{image_path}{RESET} successfully processed, image saved as {BOLD}{output_path}{RESET}")
 
 if __name__ == "__main__":
-    process_image("unfiltered-photos/IMG_1915.jpeg", "output.png")
+
+    # Iterate through files in unfiltered-photos/ directory
+    for filepath in Path('unfiltered-photos').iterdir():
+        if filepath.is_file():
+            remove_background("unfiltered-photos/" + filepath.name, filepath.name)
