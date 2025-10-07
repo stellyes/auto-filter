@@ -49,45 +49,71 @@ pip install pillow
 
 ## Usage
 
+### Directory Structure
+
+The script expects the following directory structure:
+
+```
+your-project/
+├── run.py
+├── unfiltered-photos/     # Place your input images here
+│   ├── image1.jpg
+│   ├── image2.jpg
+│   └── ...
+└── filtered-photos/       # Processed images will be saved here
+```
+
+Create the required directories:
+```bash
+mkdir unfiltered-photos filtered-photos
+```
+
 ### Basic Usage
 
-```bash
-python run.py
+1. Place your product images in the `unfiltered-photos/` directory
+2. Run the script:
+   ```bash
+   python run.py
+   ```
+3. Processed images will appear in the `filtered-photos/` directory with the same filename
+
+### How It Works
+
+The script automatically:
+- Scans all files in the `unfiltered-photos/` directory
+- Processes each image file (jpg, jpeg, png)
+- Saves the processed images to `filtered-photos/` with the original filename
+- Displays colored console output showing progress and results
+
+### Console Output
+
+The script provides colored feedback:
+- **Green**: Successfully processed images
+- **Red**: Errors (file read errors, processing failures)
+- **Bold**: Highlights filenames and important information
+
+Example output:
+```
+>>> unfiltered-photos/product1.jpg successfully processed, image saved as product1.jpg
+>>> unfiltered-photos/product2.jpg successfully processed, image saved as product2.jpg
 ```
 
-### Command Line Arguments
+### Using as a Module
 
-- `input` (required): Path to the input image file
-- `output` (required): Path to save the processed image
+You can also import and use the function directly in your own scripts:
 
-### Examples
-
-Process a single image:
-```bash
-python script.py unfiltered-photos/product1.jpg filtered-photos/product1_filtered.jpg
-```
-
-Batch processing with a shell script:
-```bash
-for file in unfiltered-photos/*.jpg; do
-    filename=$(basename "$file")
-    python script.py "$file" "filtered-photos/${filename%.*}_filtered.jpg"
-done
-```
-
-Batch processing with Python:
 ```python
-import os
-from script import remove_background
+from run import remove_background
 
-input_dir = "unfiltered-photos"
-output_dir = "filtered-photos"
+# Process a single image
+remove_background("unfiltered-photos/product.jpg", "product.jpg")
 
-for filename in os.listdir(input_dir):
-    if filename.endswith(('.jpg', '.jpeg', '.png')):
-        input_path = os.path.join(input_dir, filename)
-        output_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_filtered.jpg")
-        remove_background(input_path, output_path)
+# Custom batch processing
+from pathlib import Path
+
+for filepath in Path('custom-input-dir').iterdir():
+    if filepath.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+        remove_background(str(filepath), filepath.name)
 ```
 
 ## How It Works
